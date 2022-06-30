@@ -31,6 +31,9 @@ class Sidekiq::WorkerKiller
   # @option options [Proc] skip_shutdown_if
   #   Executes a block of code after max_rss exceeds but before requesting
   #   shutdown. (default: `proc {false}`)
+  # @option options [Array[String]] kill_queues
+  #   If specified, only requests shutdown for workers on the specified queue.
+  #   By default (default: `[]`) the worker killer runs on all queues.
   def initialize(options = {})
     @max_rss         = options.fetch(:max_rss, 0)
     @grace_time      = options.fetch(:grace_time, 15 * 60)
@@ -38,6 +41,7 @@ class Sidekiq::WorkerKiller
     @kill_signal     = options.fetch(:kill_signal, "SIGKILL")
     @gc              = options.fetch(:gc, true)
     @skip_shutdown   = options.fetch(:skip_shutdown_if, proc { false })
+    @kill_queues     = options.fetch(:kill_queues, [])
   end
 
   # @param [String, Class] worker_class
@@ -61,19 +65,21 @@ class Sidekiq::WorkerKiller
       return
     end
 
-    warn "current RSS #{current_rss} of #{identity} exceeds " \
-         "maximum RSS #{@max_rss}"
+    if @kill_queues.empty? || @kill_queues.include? queue
+      warn "current RSS #{current_rss} of #{identity} exceeds " \
+          "maximum RSS #{@max_rss}"
 
-    # Log information of failing sidekiq process before kill
-    logger = Log4r::Logger.new("sidekiq-killer-log")
-    logger.add Log4r::FileOutputter.new('logfile',
-                                        :filename=>"#{Dir.home}/sidekiq-killer.log",
-                                        :trunc=>false,
-                                        :level=>Log4r::FATAL)
-    # Note: logger.fatal won't kill the process
-    logger.fatal "Process #{::Process.pid} killed (OOM) at #{Time.now}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
+      # Log information of failing sidekiq process before kill
+      logger = Log4r::Logger.new("sidekiq-killer-log")
+      logger.add Log4r::FileOutputter.new('logfile',
+                                          :filename=>"#{Dir.home}/sidekiq-killer.log",
+                                          :trunc=>false,
+                                          :level=>Log4r::FATAL)
+      # Note: logger.fatal won't kill the process
+      logger.fatal "Process #{::Process.pid} killed (OOM) at #{Time.now}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
 
-    request_shutdown
+      request_shutdown
+    end
   end
 
   private
