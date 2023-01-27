@@ -1,13 +1,19 @@
 require "get_process_mem"
 require "sidekiq"
-require "sidekiq/util"
+begin
+  require "sidekiq/util"
+  SidekiqComponent = Sidekiq::Util
+rescue LoadError
+  require "sidekiq/middleware/modules"
+  SidekiqComponent = Sidekiq::ServerMiddleware
+end
 require "sidekiq/api"
 require 'log4r'
 
 # Sidekiq server middleware. Kill worker when the RSS memory exceeds limit
 # after a given grace time.
 class Sidekiq::WorkerKiller
-  include Sidekiq::Util
+  include SidekiqComponent
 
   MUTEX = Mutex.new
 
@@ -31,6 +37,9 @@ class Sidekiq::WorkerKiller
   # @option options [Proc] skip_shutdown_if
   #   Executes a block of code after max_rss exceeds but before requesting
   #   shutdown. (default: `proc {false}`)
+  # @option options [Proc] on_shutdown
+  #   Executes a block of code right before a shutdown happens.
+  #   (default: `nil`)
   def initialize(options = {})
     @max_rss         = options.fetch(:max_rss, 0)
     @grace_time      = options.fetch(:grace_time, 15 * 60)
@@ -38,6 +47,7 @@ class Sidekiq::WorkerKiller
     @kill_signal     = options.fetch(:kill_signal, "SIGKILL")
     @gc              = options.fetch(:gc, true)
     @skip_shutdown   = options.fetch(:skip_shutdown_if, proc { false })
+    @on_shutdown     = options.fetch(:on_shutdown, nil)
   end
 
   # @param [String, Class] worker_class
@@ -73,17 +83,23 @@ class Sidekiq::WorkerKiller
     # Note: logger.fatal won't kill the process
     logger.fatal "Process #{::Process.pid} killed (OOM) at #{Time.now}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
 
+
+    run_shutdown_hook(worker, job, queue)
     request_shutdown
   end
 
   private
+
+  def run_shutdown_hook(worker, job, queue)
+    @on_shutdown.respond_to?(:call) && @on_shutdown.call(worker, job, queue)
+  end
 
   def skip_shutdown?(worker, job, queue)
     @skip_shutdown.respond_to?(:call) && @skip_shutdown.call(worker, job, queue)
   end
 
   def request_shutdown
-    # In another thread to allow undelying job to finish
+    # In another thread to allow underlying job to finish
     Thread.new do
       # Only if another thread is not already
       # shutting down the Sidekiq process
@@ -142,6 +158,10 @@ class Sidekiq::WorkerKiller
       process["identity"] == identity
     end || raise("No sidekiq worker with identity #{identity} found")
   end
+
+  def identity
+    config[:identity] || config["identity"]
+  end unless method_defined?(:identity)
 
   def warn(msg)
     Sidekiq.logger.warn(msg)
