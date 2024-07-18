@@ -8,7 +8,6 @@ rescue LoadError
   SidekiqComponent = Sidekiq::ServerMiddleware
 end
 require "sidekiq/api"
-require 'log4r'
 
 # Sidekiq server middleware. Kill worker when the RSS memory exceeds limit
 # after a given grace time.
@@ -74,15 +73,7 @@ class Sidekiq::WorkerKiller
     warn "current RSS #{current_rss} of #{identity} exceeds " \
          "maximum RSS #{@max_rss}"
 
-    # Log information of failing sidekiq process before kill
-    logger = Log4r::Logger.new("sidekiq-killer-log")
-    logger.add Log4r::FileOutputter.new('logfile',
-                                        :filename=>"#{Dir.home}/sidekiq-killer.log",
-                                        :trunc=>false,
-                                        :level=>Log4r::FATAL)
-    # Note: logger.fatal won't kill the process
-    logger.fatal "Process #{::Process.pid} killed (OOM) at #{Time.now}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
-
+    error "Process #{::Process.pid} killed (OOM) at #{Time.now}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
 
     run_shutdown_hook(worker, job, queue)
     request_shutdown
@@ -165,5 +156,9 @@ class Sidekiq::WorkerKiller
 
   def warn(msg)
     Sidekiq.logger.warn(msg)
+  end
+
+  def error(msg)
+    Sidekiq.logger.error(msg)
   end
 end
