@@ -216,6 +216,14 @@ describe Sidekiq::WorkerKiller do
           # shutdown signal should be greater than the specified grace_time
           expect(elapsed_time).to be >= 5.0
         end
+
+        it "should not KILL the process if all jobs are finished" do
+          allow(subject).to receive(:jobs_finished?).and_return(true)
+          allow(Process).to receive(:pid).and_return(99)
+          expect(Process).not_to receive(:kill).with('SIGKILL', 99)
+
+          subject.send(:request_shutdown, worker, job, queue).join
+        end
       end
 
       context "grace time is Float::INFINITY" do
@@ -224,8 +232,8 @@ describe Sidekiq::WorkerKiller do
           allow(subject).to receive(:jobs_finished?).and_return(true)
           allow(Process).to receive(:pid).and_return(99)
           expect(sidekiq_process).to receive(:quiet!)
-          expect(sidekiq_process).to receive(:stop!)
-          expect(Process).to receive(:kill).with('SIGKILL', 99)
+          expect(sidekiq_process).not_to receive(:stop!)
+          expect(Process).not_to receive(:kill).with('SIGKILL', 99)
 
           subject.send(:request_shutdown, worker, job, queue).join
         end

@@ -105,22 +105,33 @@ class Sidekiq::WorkerKiller
     sleep(5) # gives Sidekiq API 5 seconds to update ProcessSet
 
     warn "shutting down #{identity} in #{@grace_time} seconds"
-    wait_job_finish_in_grace_time
+    if wait_job_finish_in_grace_time
+      warn 'all jobs finished gracefully'
+    else
+      warn 'grace time exceeded'
 
-    warn "stopping #{identity}"
-    sidekiq_process.stop!
+      warn "stopping #{identity}"
+      sidekiq_process.stop!
 
-    warn "waiting #{@shutdown_wait} seconds before sending " \
-          "#{@kill_signal} to #{identity}"
-    sleep(@shutdown_wait)
+      warn "waiting #{@shutdown_wait} seconds before sending " \
+            "#{@kill_signal} to #{identity}"
+      sleep(@shutdown_wait)
 
-    error "(OOM) Sending #{@kill_signal} to #{::Process.pid}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
-    ::Process.kill(@kill_signal, ::Process.pid)
+      error "(OOM) Sending #{@kill_signal} to #{::Process.pid}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
+      ::Process.kill(@kill_signal, ::Process.pid)
+    end
   end
 
+  # Returns true if the job finished within the grace period,
+  # false if the grace time was exceeded.
   def wait_job_finish_in_grace_time
     start = Time.now
-    sleep(1) until grace_time_exceeded?(start) || jobs_finished?
+
+    while true
+      return true if jobs_finished?
+      return false if grace_time_exceeded?(start)
+      sleep(1)
+    end
   end
 
   def grace_time_exceeded?(start)
