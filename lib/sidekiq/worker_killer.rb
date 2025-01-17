@@ -105,16 +105,19 @@ class Sidekiq::WorkerKiller
     sleep(5) # gives Sidekiq API 5 seconds to update ProcessSet
 
     warn "shutting down #{identity} in #{@grace_time} seconds"
-    if wait_job_finish_in_grace_time
+
+    finished_gracefully = wait_job_finish_in_grace_time
+
+    error "stopping #{identity}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
+    sidekiq_process.stop!
+
+    if finished_gracefully
       warn 'all jobs finished gracefully'
     else
       warn 'grace time exceeded'
 
-      warn "stopping #{identity}"
-      sidekiq_process.stop!
-
       warn "waiting #{@shutdown_wait} seconds before sending " \
-            "#{@kill_signal} to #{identity}"
+             "#{@kill_signal} to #{identity}"
       sleep(@shutdown_wait)
 
       error "(OOM) Sending #{@kill_signal} to #{::Process.pid}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
