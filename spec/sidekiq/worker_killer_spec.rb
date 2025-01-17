@@ -4,12 +4,19 @@ describe Sidekiq::WorkerKiller do
   let(:sidekiq_process_set) { instance_double(Sidekiq::ProcessSet) }
   let(:sidekiq_process) { instance_double(Sidekiq::Process) }
 
+  let(:worker){ double("worker") }
+  let(:job){ double("job") }
+  let(:queue){ double("queue") }
+
   before do
     allow(subject).to receive(:warn) # silence "warn" logs
+    allow(subject).to receive(:error) # silence "error" logs
     allow(subject).to receive(:sleep) # reduces tests running time
     allow(sidekiq_process).to receive(:quiet!)
     allow(sidekiq_process).to receive(:stop!)
     allow(sidekiq_process).to receive(:stopping?)
+    allow(job).to receive(:[]).with('jid').and_return(4)
+    allow(job).to receive(:[]).with('args').and_return(%w[arg1 arg2])
   end
 
   describe "#sidekiq_process" do
@@ -65,10 +72,6 @@ describe Sidekiq::WorkerKiller do
     end
 
     describe "#call" do
-      let(:worker){ double("worker") }
-      let(:job){ double("job") }
-      let(:queue){ double("queue") }
-
       it "should yield" do
         expect { |b|
           subject.call(worker, job, queue, &b)
@@ -80,8 +83,6 @@ describe Sidekiq::WorkerKiller do
 
         before do
           allow(subject).to receive(:current_rss).and_return(3)
-          allow(job).to receive(:[]).with('jid').and_return(4)
-          allow(job).to receive(:[]).with('args').and_return(5)
         end
 
         it "should request shutdown" do
@@ -90,7 +91,7 @@ describe Sidekiq::WorkerKiller do
         end
 
         it "should call garbage collect" do
-          allow(subject).to receive(:request_shutdown)
+          expect(subject).to receive(:request_shutdown).with(worker, job, queue)
           expect(GC).to receive(:start).with(full_mark: true, immediate_sweep: true)
           subject.call(worker, job, queue){}
         end
@@ -117,7 +118,7 @@ describe Sidekiq::WorkerKiller do
           context "and skip_shutdown_if returns false" do
             let(:skip_shutdown_proc) { proc { |worker, job, queue| false } }
             it "should still request shutdown" do
-              expect(subject).to receive(:request_shutdown)
+              expect(subject).to receive(:request_shutdown).with(worker, job, queue)
               subject.call(worker, job, queue){}
             end
           end
@@ -125,7 +126,7 @@ describe Sidekiq::WorkerKiller do
           context "and skip_shutdown_if returns nil" do
             let(:skip_shutdown_proc) { proc { |worker, job, queue| nil } }
             it "should still request shutdown" do
-              expect(subject).to receive(:request_shutdown)
+              expect(subject).to receive(:request_shutdown).with(worker, job, queue)
               subject.call(worker, job, queue){}
             end
           end
@@ -137,7 +138,7 @@ describe Sidekiq::WorkerKiller do
           context "and on_shutdown is a proc" do
             let(:on_shutdown_proc) { proc { |worker, job, queue| nil } }
             it "should execute on_shutdown hook" do
-              expect(subject).to receive(:request_shutdown).once
+              expect(subject).to receive(:request_shutdown).once .with(worker, job, queue)
               expect(on_shutdown_proc).to receive(:call).once
               subject.call(worker, job, queue){}
             end
@@ -146,7 +147,7 @@ describe Sidekiq::WorkerKiller do
           context "and on_shutdown is a lambda" do
             let(:on_shutdown_proc) { ->(worker, job, queue) { nil } }
             it "should execute on_shutdown hook" do
-              expect(subject).to receive(:request_shutdown).once
+              expect(subject).to receive(:request_shutdown).once .with(worker, job, queue)
               expect(on_shutdown_proc).to receive(:call).once
               subject.call(worker, job, queue){}
             end
@@ -156,7 +157,7 @@ describe Sidekiq::WorkerKiller do
         context "when gc is false" do
           subject{ described_class.new(max_rss: 2, gc: false) }
           it "should not call garbage collect" do
-            allow(subject).to receive(:request_shutdown)
+            allow(subject).to receive(:request_shutdown).with(worker, job, queue)
             expect(GC).not_to receive(:start)
             subject.call(worker, job, queue){}
           end
@@ -165,7 +166,7 @@ describe Sidekiq::WorkerKiller do
         context "but max rss is 0" do
           subject{ described_class.new(max_rss: 0) }
           it "should not request shutdown" do
-            expect(subject).to_not receive(:request_shutdown)
+            expect(subject).to_not receive(:request_shutdown).with(worker, job, queue)
             subject.call(worker, job, queue){}
           end
         end
@@ -177,29 +178,26 @@ describe Sidekiq::WorkerKiller do
         before { allow(subject).to receive(:shutdown){ sleep 0.01 } }
         it "should call shutdown" do
           expect(subject).to receive(:shutdown)
-          subject.send(:request_shutdown).join
+          subject.send(:request_shutdown, worker, job, queue).join
         end
         it "should not call shutdown twice when called concurrently" do
           expect(subject).to receive(:shutdown).once
-          2.times.map{ subject.send(:request_shutdown) }.each(&:join)
+          2.times.map{ subject.send(:request_shutdown, worker, job, queue) }.each(&:join)
         end
       end
 
       context "grace time is 5 seconds" do
         subject{ described_class.new(max_rss: 2, grace_time: 5.0, shutdown_wait: 0) }
         it "should wait the specified grace time before calling shutdown" do
-          # there are busy jobs that will not terminate within the grace time
-          allow(subject).to receive(:no_jobs_on_quiet_processes?).and_return(false)
-
           shutdown_request_time     = nil
           shutdown_time             = nil
 
           # replace the original #request_shutdown to track
           # when the shutdown is requested
           original_request_shutdown = subject.method(:request_shutdown)
-          allow(subject).to receive(:request_shutdown) do
+          allow(subject).to receive(:request_shutdown) do |*args|
             shutdown_request_time= Time.now
-            original_request_shutdown.call
+            original_request_shutdown.call(*args)
           end
 
           # track when the process has been required to stop
@@ -207,16 +205,24 @@ describe Sidekiq::WorkerKiller do
             shutdown_time = Time.now
           end
 
-          allow(Process).to receive(:kill)
           allow(Process).to receive(:pid).and_return(99)
+          expect(Process).to receive(:kill).with('SIGKILL', 99)
 
-          subject.send(:request_shutdown).join
+          subject.send(:request_shutdown, worker, job, queue).join
 
           elapsed_time = shutdown_time - shutdown_request_time
 
           # the elapsed time between shutdown request and the actual
           # shutdown signal should be greater than the specified grace_time
           expect(elapsed_time).to be >= 5.0
+        end
+
+        it "should not KILL the process if all jobs are finished" do
+          allow(subject).to receive(:jobs_finished?).and_return(true)
+          allow(Process).to receive(:pid).and_return(99)
+          expect(Process).not_to receive(:kill).with('SIGKILL', 99)
+
+          subject.send(:request_shutdown, worker, job, queue).join
         end
       end
 
@@ -226,10 +232,10 @@ describe Sidekiq::WorkerKiller do
           allow(subject).to receive(:jobs_finished?).and_return(true)
           allow(Process).to receive(:pid).and_return(99)
           expect(sidekiq_process).to receive(:quiet!)
-          expect(sidekiq_process).to receive(:stop!)
-          expect(Process).to receive(:kill).with('SIGKILL', 99)
+          expect(sidekiq_process).not_to receive(:stop!)
+          expect(Process).not_to receive(:kill).with('SIGKILL', 99)
 
-          subject.send(:request_shutdown).join
+          subject.send(:request_shutdown, worker, job, queue).join
         end
       end
     end

@@ -73,10 +73,10 @@ class Sidekiq::WorkerKiller
     warn "current RSS #{current_rss} of #{identity} exceeds " \
          "maximum RSS #{@max_rss}"
 
-    error "Process #{::Process.pid} killed (OOM) at #{Time.now}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
+    error "Initiating shutdown due to process #{::Process.pid} using RSS=#{current_rss}Mb. The process might get killed in #{@grace_time}s. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
 
     run_shutdown_hook(worker, job, queue)
-    request_shutdown
+    request_shutdown(worker, job, queue)
   end
 
   private
@@ -89,38 +89,52 @@ class Sidekiq::WorkerKiller
     @skip_shutdown.respond_to?(:call) && @skip_shutdown.call(worker, job, queue)
   end
 
-  def request_shutdown
+  def request_shutdown(worker, job, queue)
     # In another thread to allow underlying job to finish
     Thread.new do
       # Only if another thread is not already
       # shutting down the Sidekiq process
-      shutdown if MUTEX.try_lock
+      shutdown(worker, job, queue) if MUTEX.try_lock
     end
   end
 
-  def shutdown
+  def shutdown(worker, job, _queue)
     warn "sending quiet to #{identity}"
     sidekiq_process.quiet!
 
     sleep(5) # gives Sidekiq API 5 seconds to update ProcessSet
 
     warn "shutting down #{identity} in #{@grace_time} seconds"
-    wait_job_finish_in_grace_time
 
-    warn "stopping #{identity}"
+    finished_gracefully = wait_job_finish_in_grace_time
+
+    error "stopping #{identity}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
     sidekiq_process.stop!
 
-    warn "waiting #{@shutdown_wait} seconds before sending " \
-          "#{@kill_signal} to #{identity}"
-    sleep(@shutdown_wait)
+    if finished_gracefully
+      warn 'all jobs finished gracefully'
+    else
+      warn 'grace time exceeded'
 
-    warn "sending #{@kill_signal} to #{identity}"
-    ::Process.kill(@kill_signal, ::Process.pid)
+      warn "waiting #{@shutdown_wait} seconds before sending " \
+             "#{@kill_signal} to #{identity}"
+      sleep(@shutdown_wait)
+
+      error "(OOM) Sending #{@kill_signal} to #{::Process.pid}. JID: #{job['jid']}, Job: #{worker.class.name}, Args: #{job['args']}"
+      ::Process.kill(@kill_signal, ::Process.pid)
+    end
   end
 
+  # Returns true if the job finished within the grace period,
+  # false if the grace time was exceeded.
   def wait_job_finish_in_grace_time
     start = Time.now
-    sleep(1) until grace_time_exceeded?(start) || jobs_finished?
+
+    while true
+      return true if jobs_finished?
+      return false if grace_time_exceeded?(start)
+      sleep(1)
+    end
   end
 
   def grace_time_exceeded?(start)
